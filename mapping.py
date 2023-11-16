@@ -48,20 +48,21 @@ def process(_, stard_kafka_vehicles: "dict[str, Any]" or None, state: IngressSta
     return headers, [body]
 
 
-def build_material_change_indexes(materials_grouped_by_material_number: "dict[str, Any]")  ->  "list[dict]":
+def build_material_change_indexes(materials_grouped_by_material_number: "dict[str, Any]") -> "list[dict]":
     material_change_indexes = []
     for material_number, grouped_materials in materials_grouped_by_material_number.items():
         vehicle_production_steps = []
         production_step_exists = False
         for grouped_material in grouped_materials:
-            production_step = grouped_material["plannedOrderId"][0:2]
+            production_step = grouped_material["plannedOrderId"][:2]
             production_step_exists = prod_step_exist_status(grouped_material, production_step, vehicle_production_steps, production_step_exists)
             if not production_step_exists:
                 vehicle_production_step = build_vehicle_production_step(grouped_material, production_step)
                 vehicle_production_steps.append(vehicle_production_step)
 
-        material_change_index = get_material_change_index(material_change_indexes, material_number)
-        if material_change_index:
+        if material_change_index := get_material_change_index(
+            material_change_indexes, material_number
+        ):
             material_change_index["relationshipAttributes"]["quantity"] = material_change_index[
                                                                               "relationshipAttributes"
                                                                           ]["quantity"] + sum(
@@ -79,12 +80,13 @@ def build_material_change_index(grouped_materials: "list[dict]", material_number
     return {
         "type": "materialChangeIndex",
         "attributes": {
-            "partNumber": material_number[0:7],
+            "partNumber": material_number[:7],
             "changeIndex": int(material_number[7:9]),
         },
         "relationshipAttributes": {
             "quantity": sum(
-                grouped_material["quantity"] for grouped_material in grouped_materials
+                grouped_material["quantity"]
+                for grouped_material in grouped_materials
             ),
         },
         "relationshipChildren": vehicle_production_steps,
@@ -107,17 +109,16 @@ def build_vehicle_production_step(grouped_material: "dict[str|Any]", production_
 
 
 def get_material_change_index(material_change_indexes: "list", material_number: "str") -> "list|None":
-    material_change_index = next(
+    return next(
         filter(
-            lambda vehicle_production_step: material_number[0:7]
-                                            == vehicle_production_step["attributes"]["partNumber"]
-                                            and int(material_number[7:9])
-                                            == vehicle_production_step["attributes"]["changeIndex"],
+            lambda vehicle_production_step: material_number[:7]
+            == vehicle_production_step["attributes"]["partNumber"]
+            and int(material_number[7:9])
+            == vehicle_production_step["attributes"]["changeIndex"],
             material_change_indexes,
         ),
         None,
     )
-    return material_change_index
 
 
 def prod_step_exist_status(grouped_material: "dict[str|Any]", production_step: "str", vehicle_production_steps: "list", production_step_exists: "bool" = False) -> "bool":
@@ -147,13 +148,15 @@ def build_vehicle_attributes(stard_kafka_vehicles: "dict[str, Any]") -> "dict[st
     build_datetime = stard_kafka_vehicles["utcCheckpointTimestamp"]
     sap_plant_code = stard_kafka_vehicles["sapPlantId"]
     bmw_plant_code = get_bmw_plant_code(sap_plant_code)
-    vehicle_attributes = {
+    return {
         "Vin": vin,
         "SapPlantCode": sap_plant_code,
         "plantCode": bmw_plant_code,
-        "buildDate": build_datetime[0:10].replace("-", ""),
+        "buildDate": build_datetime[:10].replace("-", ""),
         "buildTime": build_datetime[11:19].replace(":", ""),
-        "buildTimestamp": stard_kafka_vehicles["utcBuildTimestamp"].replace("Z", ".000Z"),
+        "buildTimestamp": stard_kafka_vehicles["utcBuildTimestamp"].replace(
+            "Z", ".000Z"
+        ),
         "modelCode": stard_kafka_vehicles["modelCode"],
         "buildStatus": int(stard_kafka_vehicles["orderStatus"]),
         "orderNumber": stard_kafka_vehicles["orderNumber"],
@@ -163,7 +166,6 @@ def build_vehicle_attributes(stard_kafka_vehicles: "dict[str, Any]") -> "dict[st
             stard_kafka_vehicles["localCheckpointTimestamp"],
         ),
     }
-    return vehicle_attributes
 
 
 def build_headers(state: IngressState) -> "dict":
@@ -184,8 +186,7 @@ def derive_timezone(utc_time: str, local_time: str) -> "str":
 
 
 def get_bmw_plant_code(sap_plant_code: str) -> Optional[str]:
-    if sap_plant_code in plant_source_system:
-        source_system = plant_source_system[sap_plant_code]
-        return source_system_to_bmw_plant_code[source_system]
-    else:
+    if sap_plant_code not in plant_source_system:
         return None
+    source_system = plant_source_system[sap_plant_code]
+    return source_system_to_bmw_plant_code[source_system]
