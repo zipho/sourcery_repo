@@ -1,192 +1,219 @@
+from __future__ import annotations
 from dvf.logging import Logger
 from dvf.utils.env import getvar
 from dvf.utils.state import IngressState
 from dvf.exceptions import DvfException
 from collections import defaultdict
-from typing import Any, Optional
-from datetime import datetime, timezone
+from typing import Any
 
 logger = Logger(__file__)
 
-plant_source_system = {
-    "A110TUP": "StardMuc",
-    "A120TDP": "StardDgf",
-    "A110TUQ": "StardMuc",
-    "A120TDQ": "StardDgf",
-    "A130": "StardBer",
-    "A150": "StardLpz",
-    "LY78": "StardSlp",
-    "MU80": "StardOxf",
-    "A160": "StardReg",
-}
 
-source_system_to_bmw_plant_code = {
-    "StardMuc": "01.10",
-    "StardDgf": "02.40",
-    "StardBer": "03.10",
-    "StardLpz": "07.10",
-    "StardSlp": "30.10",
-    "StardOxf": "34.00",
-    "StardReg": "06.10",
-}
-
-
-def process(_, stard_kafka_vehicles: "dict[str, Any]" or None, state: IngressState):
-    if stard_kafka_vehicles is None:
+def process(_, proton_vehicle_payload: dict[str, Any], state: IngressState):
+    if proton_vehicle_payload is None:
         raise DvfException("Empty payload.", state.tags)
 
+    # START
+    vehicle_identity_number = get_vin(proton_vehicle_payload)
+    build_datetime = proton_vehicle_payload["actualCustomerOrder"]["pimaData"]["OrderProduction"][
+        "BuildTime"
+    ]
     headers = build_headers(state)
-    vehicle_attributes = build_vehicle_attributes(stard_kafka_vehicles)
-    materials_grouped_by_material_number = build_grouped_materials(stard_kafka_vehicles)
-    material_change_indexes = build_material_change_indexes(materials_grouped_by_material_number)
 
+    planned_orders = proton_vehicle_payload["actualCustomerOrderMaterial"]["plannedOrders"]
+    planned_orders_startwith_vh_ = list(
+        filter(
+            lambda planned_order: planned_order["plannedOrderId"].startswith("VH_"),
+            planned_orders,
+        )
+    )
+
+    # get vehicle attributes
+    vehicle_attributes = get_vehicles_attributes(
+        build_datetime,
+        planned_orders_startwith_vh_,
+        proton_vehicle_payload,
+        vehicle_identity_number,
+    )
+
+    # get header materials
+    header_materials = get_header_material_per_planned_order_id(proton_vehicle_payload)
+
+    material_change_indexes = []
+    for planned_order in planned_orders:
+        production_step = planned_order["plannedOrderId"][:2]
+        unique_demands = defaultdict(list)
+        for demand in planned_order["demands"]:
+            unique_demands[(demand["materialNumber"])].append(demand)
+
+        generate_children(
+            header_materials,
+            material_change_indexes,
+            planned_order,
+            production_step,
+            unique_demands,
+        )
     body = {
         "type": "vehicle",
         "attributes": vehicle_attributes,
         "children": material_change_indexes,
     }
+
+    # END
     return headers, [body]
 
 
-def build_material_change_indexes(materials_grouped_by_material_number: "dict[str, Any]") -> "list[dict]":
-    material_change_indexes = []
-    for material_number, grouped_materials in materials_grouped_by_material_number.items():
+def generate_children(
+    header_materials: dict[str:Any],
+    material_change_indexes: list,
+    planned_order: dict[str:Any],
+    production_step: str,
+    unique_demands: defaultdict,
+):
+    for material_number, demands in unique_demands.items():
         vehicle_production_steps = []
-        production_step_exists = False
-        for grouped_material in grouped_materials:
-            production_step = grouped_material["plannedOrderId"][:2]
-            production_step_exists = prod_step_exist_status(grouped_material, production_step, vehicle_production_steps, production_step_exists)
-            if not production_step_exists:
-                vehicle_production_step = build_vehicle_production_step(grouped_material, production_step)
-                vehicle_production_steps.append(vehicle_production_step)
-
-        if material_change_index := get_material_change_index(
-            material_change_indexes, material_number
-        ):
-            material_change_index["relationshipAttributes"]["quantity"] = material_change_index[
-                                                                              "relationshipAttributes"
-                                                                          ]["quantity"] + sum(
-                grouped_material["quantity"] for grouped_material in grouped_materials
+        is_step_added = False
+        for demand in demands:
+            is_step_added = get_step_added_status(
+                demand, is_step_added, production_step, vehicle_production_steps
             )
-            material_change_index["relationshipChildren"] += vehicle_production_steps
-        else:
-            material_change_index = build_material_change_index(grouped_materials, material_number,
-                                                                vehicle_production_steps)
-            material_change_indexes.append(material_change_index)
-    return material_change_indexes
+            if not is_step_added:
+                build_vehicle_production_step(
+                    demand,
+                    header_materials,
+                    planned_order,
+                    production_step,
+                    vehicle_production_steps,
+                )
+
+        material_change_index = get_mci(material_change_indexes, material_number)
+        handle_material_change_indexes(
+            demands,
+            material_change_index,
+            material_change_indexes,
+            material_number,
+            vehicle_production_steps,
+        )
 
 
-def build_material_change_index(grouped_materials: "list[dict]", material_number: "str", vehicle_production_steps: "list[dict]") -> "dict[str|Any]":
-    return {
-        "type": "materialChangeIndex",
-        "attributes": {
-            "partNumber": material_number[:7],
-            "changeIndex": int(material_number[7:9]),
-        },
-        "relationshipAttributes": {
-            "quantity": sum(
-                grouped_material["quantity"]
-                for grouped_material in grouped_materials
-            ),
-        },
-        "relationshipChildren": vehicle_production_steps,
-    }
+def handle_material_change_indexes(
+    demands,
+    material_change_index,
+    material_change_indexes,
+    material_number,
+    vehicle_production_steps,
+):
+    if material_change_index:
+        material_change_index["relationshipAttributes"]["quantity"] = material_change_index[
+            "relationshipAttributes"
+        ]["quantity"] + sum(demand["quantity"] for demand in demands)
+        material_change_index["relationshipChildren"] += vehicle_production_steps
+    else:
+        material_change_index = {
+            "type": "materialChangeIndex",
+            "attributes": {
+                "partNumber": material_number[:7],
+                "changeIndex": int(material_number[7:9]),
+            },
+            "relationshipAttributes": {
+                "quantity": sum(demand["quantity"] for demand in demands),
+            },
+            "relationshipChildren": vehicle_production_steps,
+        }
+        material_change_indexes.append(material_change_index)
 
 
-def build_vehicle_production_step(grouped_material: "dict[str|Any]", production_step: "str") -> "dict[str|Any]":
-    return {
+def build_vehicle_production_step(
+    demand, header_materials, planned_order, production_step, vehicle_production_steps
+):
+    vehicle_production_step = {
         "type": "vehicleProductionStep",
         "attributes": {"productionStep": production_step},
         "relationshipAttributes": {
-            "quantity": grouped_material["quantity"],
-            "plannedOrderNumber": grouped_material["plannedOrderId"],
-            "reservationItemNumber": grouped_material["reservationPosition"],
-            "reservationNumber": grouped_material["reservationNumber"],
-            "materialGroupTopLevel": grouped_material["peggedRequirement"],
-            "itemCategory": grouped_material["itemCategory"],
+            "quantity": demand["quantity"],
+            "plannedOrderNumber": planned_order["plannedOrderId"],
+            "materialGroupTopLevel": header_materials.get(planned_order["plannedOrderId"]),
         },
     }
+    vehicle_production_steps.append(vehicle_production_step)
 
 
-def get_material_change_index(material_change_indexes: "list", material_number: "str") -> "list|None":
+def get_mci(material_change_indexes, material_number):
     return next(
         filter(
-            lambda vehicle_production_step: material_number[:7]
-            == vehicle_production_step["attributes"]["partNumber"]
-            and int(material_number[7:9])
-            == vehicle_production_step["attributes"]["changeIndex"],
+            lambda item: material_number[:7]
+            == item["attributes"]["partNumber"]
+            and int(material_number[7:9]) == item["attributes"]["changeIndex"],
             material_change_indexes,
         ),
         None,
     )
 
 
-def prod_step_exist_status(grouped_material: "dict[str|Any]", production_step: "str", vehicle_production_steps: "list", production_step_exists: "bool" = False) -> "bool":
-    for vehicle_production_step in vehicle_production_steps:
-        if vehicle_production_step["attributes"]["productionStep"] == production_step:
-            vehicle_production_step["relationshipAttributes"][
-                "quantity"
-            ] += grouped_material["quantity"]
-            production_step_exists = True
-            break
+def get_step_added_status(demand, is_step_added, production_step, vehicle_production_steps):
+    for item in vehicle_production_steps:
+        if item["attributes"]["productionStep"] == production_step:
+            item["relationshipAttributes"]["quantity"] += demand["quantity"]
+            is_step_added = True
         else:
-            production_step_exists = False
-    return production_step_exists
+            is_step_added = False
+    return is_step_added
 
 
-def build_grouped_materials(stard_kafka_vehicles: "dict[str, Any]") -> "defaultdict":
-    all_materials = stard_kafka_vehicles["materials"]
-    filtered_materials = [m for m in all_materials if m["plannedOrderId"].startswith("VH_")]
-    materials_grouped_by_material_number = defaultdict(list)
-    for material in filtered_materials:
-        materials_grouped_by_material_number[material["materialNumber"]].append(material)
-    return materials_grouped_by_material_number
-
-
-def build_vehicle_attributes(stard_kafka_vehicles: "dict[str, Any]") -> "dict[str, Any]":
-    vin = stard_kafka_vehicles["vin17"]
-    build_datetime = stard_kafka_vehicles["utcCheckpointTimestamp"]
-    sap_plant_code = stard_kafka_vehicles["sapPlantId"]
-    bmw_plant_code = get_bmw_plant_code(sap_plant_code)
-    return {
-        "Vin": vin,
-        "SapPlantCode": sap_plant_code,
-        "plantCode": bmw_plant_code,
+def get_vehicles_attributes(
+    build_datetime: dict[str:Any],
+    planned_orders_startwith_vh: dict[str:Any],
+    proton_vehicle_payload: dict[str:Any],
+    vehicle_identity_number: dict[str:Any],
+):
+    vehicle_attributes = {
+        "Vin": vehicle_identity_number,
         "buildDate": build_datetime[:10].replace("-", ""),
         "buildTime": build_datetime[11:19].replace(":", ""),
-        "buildTimestamp": stard_kafka_vehicles["utcBuildTimestamp"].replace(
-            "Z", ".000Z"
+        "modelCode": proton_vehicle_payload["actualCustomerOrder"]["pimaData"][
+            "PipelineOrderAttributes"
+        ]["ManufacturerModelCode"],
+        "buildStatus": int(
+            proton_vehicle_payload["actualCustomerOrder"]["orderAttributes"][
+                "orderStatus"
+            ]
         ),
-        "modelCode": stard_kafka_vehicles["modelCode"],
-        "buildStatus": int(stard_kafka_vehicles["orderStatus"]),
-        "orderNumber": stard_kafka_vehicles["orderNumber"],
-        "checkpointTimestamp": build_datetime.replace("Z", ".000Z"),
-        "checkpointTimeZone": derive_timezone(
-            stard_kafka_vehicles["utcCheckpointTimestamp"],
-            stard_kafka_vehicles["localCheckpointTimestamp"],
-        ),
+        "orderNumber": proton_vehicle_payload["actualCustomerOrder"][
+            "orderNumber"
+        ],
+        "plantCode": planned_orders_startwith_vh[0]["plantId"],
+        "SapPlantCode": planned_orders_startwith_vh[0]["sapPlantId"],
+    }
+    # override attribute values
+    if vehicle_attributes["buildStatus"] == 5500:
+        vehicle_attributes["buildStatus"] = 6000
+    return vehicle_attributes
+
+
+def build_headers(state: IngressState):
+    return {
+        "BMW-DVF-Contract-ID": "PRIW",
+        "BMW-DVF-Source-System": "protonOxf",
+        "BMW-DVF-Source-Tracking-String": state.tags,
     }
 
 
-def build_headers(state: IngressState) -> "dict":
-    s3_object_key = get_s3_object_key(state)
-    if not get_s3_object_key(state):
-        raise DvfException("S3 object key could not be resolved.", state.tags)
-    return {"s3_object_key": s3_object_key, "s3_object_format": "json"}
+def get_vin(proton_vehicle_payload: dict[str, Any]):
+    return (
+        proton_vehicle_payload["actualCustomerOrder"]["pimaData"][
+            "ActualOrder"
+        ]["VIN10"]
+        + proton_vehicle_payload["actualCustomerOrder"]["pimaData"][
+            "ActualOrder"
+        ]["VIN7"]
+    )
 
 
-def get_s3_object_key(state: IngressState) -> "str":
-    return state.tags["s3_object"]
-
-
-def derive_timezone(utc_time: str, local_time: str) -> "str":
-    utc_datetime = datetime.strptime(utc_time, "%Y-%m-%dT%H:%M:%SZ")
-    local_datetime = datetime.strptime(local_time, "%Y-%m-%dT%H:%M:%S")
-    return str(timezone(local_datetime - utc_datetime)).replace("UTC", "").replace(":", "")
-
-
-def get_bmw_plant_code(sap_plant_code: str) -> Optional[str]:
-    if sap_plant_code not in plant_source_system:
-        return None
-    source_system = plant_source_system[sap_plant_code]
-    return source_system_to_bmw_plant_code[source_system]
+def get_header_material_per_planned_order_id(proton_vehicle_payload: dict[str:Any]):
+    header_materials = {}
+    orders_per_plant = proton_vehicle_payload["actualCustomerOrder"]["orderPerPlant"]
+    for order_per_plant in orders_per_plant:
+        planned_orders = order_per_plant["plannedOrder"]
+        for planned_order in planned_orders:
+            header_materials[planned_order["plannedOrderId"]] = planned_order["headerMaterial"]
+    return header_materials
